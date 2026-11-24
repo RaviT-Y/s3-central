@@ -1,0 +1,5 @@
+# Repositories whose ARMOR artifacts (apichecker-reports / abichecker-reports)
+# are published to S3. One owner/repo per line; '#' starts a comment.
+# Changes to this file go through review on the default branch.
+
+qualcomm/fastrpc

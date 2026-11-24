@@ -1,0 +1,28 @@
+name: Publisher tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Never point this at the AWS upload runner: pull request code runs here.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Shell syntax
+        run: bash -n scripts/assert_no_aws_credentials.sh
+
+      - name: No AWS credentials on this runner
+        run: bash scripts/assert_no_aws_credentials.sh

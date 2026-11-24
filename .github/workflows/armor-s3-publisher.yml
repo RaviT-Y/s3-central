@@ -1,0 +1,304 @@
+# ARMOR S3 publisher (trusted, runs once a day from the default branch).
+#
+#   collect   GitHub-hosted, read-only token   list ARMOR artifacts of every repo in repos.txt,
+#                                              keep completed runs not yet processed, download zips
+#   validate  GitHub-hosted, no AWS, no token   check every artifact; failures are ignored and the
+#                                              next artifact is processed
+#   upload    AWS self-hosted runner            aws s3 cp of validated files only (keys from trusted data)
+#   finalize  GitHub-hosted                     ledger + summary; FAILS the run if any artifact was
+#                                              ignored or hit an error
+#
+# Repository configuration (Settings > Secrets and variables > Actions > Variables):
+#   ARMOR_S3_UPLOAD_RUNS_ON   runner for the upload job, JSON (default ["self-hosted","armor-s3-upload"])
+#   ARMOR_S3_BUCKET           target bucket (default qli-prd-armor-gh-artifacts)
+#   ARMOR_S3_BUCKET_OWNER     optional 12-digit AWS account id that must own the bucket
+#   ARMOR_CHECKER_WORKFLOWS   optional trusted ARMOR reusable workflow path(s)
+#                             (default qualcomm/armor-checkers/.github/workflows/armor-checker.yml)
+#   ARMOR_PUBLISHER_APP_CLIENT_ID / secret ARMOR_PUBLISHER_APP_PRIVATE_KEY
+#                             optional GitHub App, only if the default token cannot read other repos
+
+name: ARMOR S3 Publisher
+
+on:
+  schedule:
+    - cron: "17 3 * * *"          # once a day, 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      lookback-hours:
+        description: "Look back this many hours for ARMOR artifacts (raise it to backfill, max 2160)"
+        required: false
+        default: "48"
+      dry-run:
+        description: "Validate and print the S3 keys, but upload nothing and keep the ledger unchanged"
+        type: boolean
+        required: false
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: armor-s3-publisher
+  cancel-in-progress: false
+
+env:
+  LOOKBACK_HOURS: ${{ inputs.lookback-hours || '48' }}
+  DRY_RUN: ${{ inputs.dry-run && 'true' || 'false' }}
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  collect:
+    name: Collect ARMOR runs and artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read          # previous ledger + other repos' artifacts (public repos)
+      contents: read         # checkout of this repository
+    outputs:
+      candidates-sha256: ${{ steps.collect.outputs.candidates_sha256 }}
+      downloaded: ${{ steps.collect.outputs.downloaded }}
+    steps:
+      - name: Checkout publisher (trusted default branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Assert no AWS credentials
+        run: bash scripts/assert_no_aws_credentials.sh
+
+      - name: Create GitHub App token (optional)
+        id: app
+        if: ${{ vars.ARMOR_PUBLISHER_APP_CLIENT_ID != '' }}
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.ARMOR_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.ARMOR_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: ${{ vars.ARMOR_PUBLISHER_APP_OWNER || github.repository_owner }}
+          permission-actions: read
+          permission-pull-requests: read
+
+      - name: Collect
+        id: collect
+        env:
+          CENTRAL_TOKEN: ${{ github.token }}
+          SOURCE_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          ARMOR_CHECKER_WORKFLOWS: ${{ vars.ARMOR_CHECKER_WORKFLOWS }}
+        run: >-
+          python3 -I scripts/armor_publisher/publisher.py collect
+          --repos-file repos.txt
+          --lookback-hours "$LOOKBACK_HOURS"
+          --out "$RUNNER_TEMP/collect"
+
+      - name: Upload candidate list
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: publisher-candidates
+          path: ${{ runner.temp }}/collect/candidates.json
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload downloaded ARMOR artifacts (still unvalidated)
+        if: ${{ steps.collect.outputs.downloaded != '0' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: publisher-raw
+          path: ${{ runner.temp }}/collect/raw/
+          retention-days: 1
+          if-no-files-found: error
+
+  validate:
+    name: Validate artifacts (untrusted input)
+    needs: collect
+    if: ${{ needs.collect.outputs.downloaded != '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      accepted: ${{ steps.validate.outputs.accepted }}
+    steps:
+      - name: Checkout publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Assert no AWS credentials
+        run: bash scripts/assert_no_aws_credentials.sh
+
+      - name: Download candidate list
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publisher-candidates
+          path: ${{ runner.temp }}/collect
+
+      - name: Download raw ARMOR artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publisher-raw
+          path: ${{ runner.temp }}/collect/raw
+
+      - name: Validate
+        id: validate
+        env:
+          CANDIDATES_SHA256: ${{ needs.collect.outputs.candidates-sha256 }}
+        run: >-
+          python3 -I scripts/armor_publisher/publisher.py validate
+          --collect-dir "$RUNNER_TEMP/collect"
+          --candidates-sha256 "$CANDIDATES_SHA256"
+          --out "$RUNNER_TEMP/bundle"
+
+      - name: Upload validation report
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: publisher-validation
+          path: ${{ runner.temp }}/bundle/validation.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload validated files
+        if: ${{ steps.validate.outputs.accepted != '0' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: publisher-validated
+          path: ${{ runner.temp }}/bundle/
+          retention-days: 1
+          if-no-files-found: error
+
+  upload:
+    name: Upload to S3
+    needs: [collect, validate]
+    if: ${{ needs.validate.result == 'success' && needs.validate.outputs.accepted != '0' }}
+    # Dry runs need no AWS access, so they stay on a GitHub-hosted runner.
+    runs-on: ${{ fromJSON(inputs.dry-run && '"ubuntu-latest"' || vars.ARMOR_S3_UPLOAD_RUNS_ON || '["self-hosted", "armor-s3-upload"]') }}
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Clean work directories (self-hosted runners can keep files between jobs)
+        run: rm -rf "$RUNNER_TEMP/publisher"
+
+      - name: Checkout publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          clean: true
+
+      - name: Download candidate list
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publisher-candidates
+          path: ${{ runner.temp }}/publisher/collect
+
+      - name: Download validated files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publisher-validated
+          path: ${{ runner.temp }}/publisher/bundle
+
+      - name: Upload validated files to S3
+        env:
+          CANDIDATES_SHA256: ${{ needs.collect.outputs.candidates-sha256 }}
+          S3_BUCKET: ${{ vars.ARMOR_S3_BUCKET || 'qli-prd-armor-gh-artifacts' }}
+          S3_BUCKET_OWNER: ${{ vars.ARMOR_S3_BUCKET_OWNER }}
+        run: |
+          set -euo pipefail
+          dry_run=()
+          if [[ "$DRY_RUN" == "true" ]]; then dry_run=(--dry-run); fi
+          python3 -I scripts/armor_publisher/publisher.py upload \
+            --candidates "$RUNNER_TEMP/publisher/collect/candidates.json" \
+            --candidates-sha256 "$CANDIDATES_SHA256" \
+            --bundle "$RUNNER_TEMP/publisher/bundle" \
+            --bucket "$S3_BUCKET" \
+            --expected-bucket-owner "$S3_BUCKET_OWNER" \
+            --out "$RUNNER_TEMP/publisher/upload-results.json" \
+            ${dry_run[@]+"${dry_run[@]}"}
+
+      - name: Upload S3 results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: publisher-upload-results
+          path: ${{ runner.temp }}/publisher/upload-results.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Remove local copies
+        if: ${{ always() }}
+        run: rm -rf "$RUNNER_TEMP/publisher"
+
+  finalize:
+    name: Record results
+    needs: [collect, validate, upload]
+    if: ${{ always() && needs.collect.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Assert no AWS credentials
+        run: bash scripts/assert_no_aws_credentials.sh
+
+      - name: Download candidate list
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publisher-candidates
+          path: ${{ runner.temp }}/final/collect
+
+      - name: Download validation report
+        if: ${{ needs.validate.result == 'success' }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publisher-validation
+          path: ${{ runner.temp }}/final/validation
+
+      - name: Download S3 results
+        if: ${{ needs.upload.result != 'skipped' }}
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publisher-upload-results
+          path: ${{ runner.temp }}/final/upload
+
+      - name: Summarise and update ledger
+        id: finalize
+        env:
+          CANDIDATES_SHA256: ${{ needs.collect.outputs.candidates-sha256 }}
+        run: |
+          set -euo pipefail
+          dry_run=()
+          if [[ "$DRY_RUN" == "true" ]]; then dry_run=(--dry-run); fi
+          python3 -I scripts/armor_publisher/publisher.py finalize \
+            --candidates "$RUNNER_TEMP/final/collect/candidates.json" \
+            --candidates-sha256 "$CANDIDATES_SHA256" \
+            --validation "$RUNNER_TEMP/final/validation/validation.json" \
+            --upload-results "$RUNNER_TEMP/final/upload/upload-results.json" \
+            --out "$RUNNER_TEMP/final/ledger" \
+            ${dry_run[@]+"${dry_run[@]}"}
+
+      - name: Save ledger for the next run
+        if: ${{ steps.finalize.outcome == 'success' && env.DRY_RUN != 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: armor-publisher-ledger
+          path: ${{ runner.temp }}/final/ledger/ledger.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Fail if any artifact was ignored or not uploaded
+        env:
+          FAILED: ${{ steps.finalize.outputs.failed }}
+        run: |
+          if [[ "${FAILED:-1}" != "0" ]]; then
+            echo "::error::${FAILED:-unknown} ARMOR artifact(s) were ignored or not uploaded. See the job summary."
+            exit 1
+          fi
+          echo "All collected ARMOR artifacts were validated and uploaded."
